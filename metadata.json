@@ -1,0 +1,6 @@
+{
+  "name": "Thiru Study Circle - Admin Portal",
+  "description": "Comprehensive web management portal for Thiru Study Circle to add, edit, and delete video lectures, create and manage exams and question papers, distribute study materials, and monitor student learning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
