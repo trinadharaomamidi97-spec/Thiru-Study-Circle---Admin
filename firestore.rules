@@ -1,8 +1,55 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if true;
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        ('email' in request.auth.token && request.auth.token.email.lower() == 'trinadharaomamidi97@gmail.com') ||
+        (exists(/databases/$(database)/documents/app_users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/app_users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    // User profiles: each user can read/write their own profile doc; admins have full access
+    match /app_users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow create, update: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // Courses / Batches: authenticated users can read; admins can write
+    match /courses/{courseId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Videos: authenticated users can read; admins can write
+    match /videos/{videoId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // CBT Exams: authenticated users can read; admins can write
+    match /exams/{examId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Study Materials: authenticated users can read; admins can write
+    match /materials/{materialId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Announcements: authenticated users can read; admins can write
+    match /announcements/{announcementId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
   }
 }

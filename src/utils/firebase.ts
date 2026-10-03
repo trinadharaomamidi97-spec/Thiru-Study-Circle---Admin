@@ -1,5 +1,5 @@
-import { initializeApp } from 'firebase/app';
-import { initializeFirestore, collection, doc, writeBatch, getDocs, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeFirestore, getFirestore, collection, doc, writeBatch, getDocs, getDoc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 import { ThiruData, Course, Video, Exam, StudyMaterial, Announcement, AppUser } from '../types';
 import { INITIAL_THIRU_DATA } from '../sampleData';
@@ -20,12 +20,22 @@ const databaseId = firebaseConfigJson.firestoreDatabaseId && firebaseConfigJson.
   ? firebaseConfigJson.firestoreDatabaseId
   : undefined;
 
-const app = initializeApp(firebaseConfig);
-// Initializing firestore with databaseId from config and enabling long polling to bypass WebSocket restrictions in iframes
-export const db = databaseId 
-  ? initializeFirestore(app, { experimentalForceLongPolling: true }, databaseId)
-  : initializeFirestore(app, { experimentalForceLongPolling: true });
+// Ensure strictly ONE Firebase app instance is initialized
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+
+// Use standard Firestore web transport (replaces forced long-polling)
+export const db = databaseId ? getFirestore(app, databaseId) : getFirestore(app);
+
+// Print Diagnostic App Info
+const apps = getApps();
+console.log('=== FIREBASE APPS INITIALIZATION ===');
+console.log('Number of Firebase apps:', apps.length);
+console.log('auth.app === db.app:', auth.app === db.app);
+apps.forEach((a, idx) => {
+  console.log(`App [${idx}] Name: ${a.name}, ProjectId: ${a.options.projectId}`);
+});
+console.log('db initialized at: src/utils/firebase.ts (Project:', firebaseConfig.projectId, 'DatabaseId:', databaseId || '(default)', ')');
 
 // Collection Names
 const COURSES_COLL = 'courses';
@@ -36,12 +46,154 @@ const ANNOUNCEMENTS_COLL = 'announcements';
 const USERS_COLL = 'app_users';
 
 /**
+ * Helper to log request details
+ */
+export function logFirestoreRequest(path: string, operation: string) {
+  const currentUser = auth.currentUser;
+  console.log('=== FIRESTORE REQUEST ===');
+  console.log(`PATH: ${path}`);
+  console.log(`OPERATION: ${operation}`);
+  console.log(`PROJECT ID: ${firebaseConfig.projectId}`);
+  console.log(`DATABASE ID: ${databaseId || '(default)'}`);
+  console.log(`AUTH UID: ${currentUser ? currentUser.uid : 'UNAUTHENTICATED'}`);
+  console.log(`AUTH EMAIL: ${currentUser ? currentUser.email : 'UNAUTHENTICATED'}`);
+}
+
+export function logFirestoreError(path: string, err: any) {
+  console.error('=== FIRESTORE ERROR ===');
+  console.error(`PATH: ${path}`);
+  console.error(`ERROR CODE: ${err.code || 'unknown'}`);
+  console.error(`ERROR MESSAGE: ${err.message || String(err)}`);
+}
+
+/**
+ * Step 5: Direct Firestore Access Verification Function
+ */
+export async function testDirectFirestoreAccess(uid: string): Promise<{
+  profileSuccess: boolean;
+  coursesSuccess: boolean;
+  profileExists: boolean;
+  coursesCount: number;
+  errorCode?: string;
+  errorMessage?: string;
+}> {
+  const currentUser = auth.currentUser;
+  let hasToken = 'NO';
+  try {
+    const tokenResult = await currentUser?.getIdTokenResult();
+    hasToken = tokenResult?.token ? 'YES' : 'NO';
+  } catch {
+    hasToken = 'NO';
+  }
+
+  const result = {
+    profileSuccess: false,
+    coursesSuccess: false,
+    profileExists: false,
+    coursesCount: 0,
+    errorCode: undefined as string | undefined,
+    errorMessage: undefined as string | undefined
+  };
+
+  try {
+    const profileRef = doc(db, USERS_COLL, uid);
+    logFirestoreRequest(`${USERS_COLL}/${uid}`, 'getDoc (Direct Test)');
+    const profileSnap = await getDoc(profileRef);
+    result.profileSuccess = true;
+    result.profileExists = profileSnap.exists();
+    console.log(`DIRECT PROFILE READ = SUCCESS (exists: ${profileSnap.exists()})`);
+  } catch (err: any) {
+    result.errorCode = err.code || 'unknown';
+    result.errorMessage = err.message || String(err);
+    console.error(`DIRECT PROFILE READ = FAILED`);
+    logFirestoreError(`${USERS_COLL}/${uid}`, err);
+  }
+
+  try {
+    const coursesRef = collection(db, COURSES_COLL);
+    logFirestoreRequest(COURSES_COLL, 'getDocs (Direct Test)');
+    const coursesSnap = await getDocs(coursesRef);
+    result.coursesSuccess = true;
+    result.coursesCount = coursesSnap.size;
+    console.log(`DIRECT COURSES READ = SUCCESS (count: ${coursesSnap.size})`);
+  } catch (err: any) {
+    if (!result.errorCode) {
+      result.errorCode = err.code || 'unknown';
+      result.errorMessage = err.message || String(err);
+    }
+    console.error(`DIRECT COURSES READ = FAILED`);
+    logFirestoreError(COURSES_COLL, err);
+  }
+
+  if (!result.profileSuccess || !result.coursesSuccess) {
+    console.log('=== DIRECT TEST FAILURE DIAGNOSTICS ===');
+    console.log(`PROJECT ID = ${firebaseConfig.projectId}`);
+    console.log(`DATABASE ID = ${databaseId || '(default)'}`);
+    console.log(`AUTH UID = ${currentUser ? currentUser.uid : 'UNAUTHENTICATED'}`);
+    console.log(`AUTH EMAIL = ${currentUser ? currentUser.email : 'UNAUTHENTICATED'}`);
+    console.log(`AUTH TOKEN PRESENT = ${hasToken}`);
+    console.log(`DIRECT PROFILE READ = ${result.profileSuccess ? 'SUCCESS' : 'FAILED'}`);
+    console.log(`DIRECT COURSES READ = ${result.coursesSuccess ? 'SUCCESS' : 'FAILED'}`);
+    console.log(`ERROR CODE = ${result.errorCode}`);
+    console.log(`ERROR MESSAGE = ${result.errorMessage}`);
+  }
+
+  return result;
+}
+
+/**
  * Checks if Firestore is empty. Seeding is disabled to protect the live connected database.
  */
 export async function seedFirestoreIfEmpty(): Promise<boolean> {
-  // Prevent automated seeding of sample data on the user's live production database
   console.log('Automated seeding has been bypassed to protect the live database thiru-study-cercle.');
   return false;
+}
+
+/**
+ * Helper to subscribe to onSnapshot with a safe transient error retry mechanism.
+ */
+function onSnapshotWithRetry(
+  queryRef: any,
+  pathName: string,
+  onNext: (snapshot: any) => void,
+  onError: (error: any) => void,
+  maxRetries = 4,
+  delayMs = 800
+): () => void {
+  let unsub: (() => void) | undefined;
+  let retries = 0;
+  let isUnsubscribed = false;
+
+  const subscribe = () => {
+    if (isUnsubscribed) return;
+    if (unsub) {
+      try { unsub(); } catch {}
+    }
+
+    logFirestoreRequest(pathName, 'listen (onSnapshotWithRetry)');
+
+    unsub = onSnapshot(queryRef, (snap) => {
+      onNext(snap);
+    }, (err: any) => {
+      if (err.code === 'permission-denied' && retries < maxRetries) {
+        retries++;
+        console.warn(`Transient permission-denied for ${pathName}. Retrying listener (attempt ${retries}/${maxRetries})...`);
+        setTimeout(subscribe, delayMs);
+      } else {
+        logFirestoreError(pathName, err);
+        onError(err);
+      }
+    });
+  };
+
+  subscribe();
+
+  return () => {
+    isUnsubscribed = true;
+    if (unsub) {
+      try { unsub(); } catch {}
+    }
+  };
 }
 
 /**
@@ -64,40 +216,40 @@ export function syncFirestoreData(onUpdate: (data: ThiruData) => void): () => vo
 
   // 1. Courses
   unsubscribes.push(
-    onSnapshot(collection(db, COURSES_COLL), (snap) => {
-      currentData.courses = snap.docs.map(d => ({ ...d.data(), id: d.id } as Course));
+    onSnapshotWithRetry(collection(db, COURSES_COLL), COURSES_COLL, (snap: any) => {
+      currentData.courses = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as Course));
       handleUpdate();
     }, (err) => console.error('Error fetching courses:', err))
   );
 
   // 2. Videos
   unsubscribes.push(
-    onSnapshot(collection(db, VIDEOS_COLL), (snap) => {
-      currentData.videos = snap.docs.map(d => ({ ...d.data(), id: d.id } as Video));
+    onSnapshotWithRetry(collection(db, VIDEOS_COLL), VIDEOS_COLL, (snap: any) => {
+      currentData.videos = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as Video));
       handleUpdate();
     }, (err) => console.error('Error fetching videos:', err))
   );
 
   // 3. Exams
   unsubscribes.push(
-    onSnapshot(collection(db, EXAMS_COLL), (snap) => {
-      currentData.exams = snap.docs.map(d => ({ ...d.data(), id: d.id } as Exam));
+    onSnapshotWithRetry(collection(db, EXAMS_COLL), EXAMS_COLL, (snap: any) => {
+      currentData.exams = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as Exam));
       handleUpdate();
     }, (err) => console.error('Error fetching exams:', err))
   );
 
   // 4. Materials
   unsubscribes.push(
-    onSnapshot(collection(db, MATERIALS_COLL), (snap) => {
-      currentData.materials = snap.docs.map(d => ({ ...d.data(), id: d.id } as StudyMaterial));
+    onSnapshotWithRetry(collection(db, MATERIALS_COLL), MATERIALS_COLL, (snap: any) => {
+      currentData.materials = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as StudyMaterial));
       handleUpdate();
     }, (err) => console.error('Error fetching materials:', err))
   );
 
   // 5. Announcements
   unsubscribes.push(
-    onSnapshot(collection(db, ANNOUNCEMENTS_COLL), (snap) => {
-      currentData.announcements = snap.docs.map(d => ({ ...d.data(), id: d.id } as Announcement));
+    onSnapshotWithRetry(collection(db, ANNOUNCEMENTS_COLL), ANNOUNCEMENTS_COLL, (snap: any) => {
+      currentData.announcements = snap.docs.map((d: any) => ({ ...d.data(), id: d.id } as Announcement));
       handleUpdate();
     }, (err) => console.error('Error fetching announcements:', err))
   );
@@ -189,8 +341,8 @@ export async function deleteUserFromFirebase(userId: string): Promise<void> {
 }
 
 export function syncUsersFromFirebase(onUpdate: (users: AppUser[]) => void): () => void {
-  return onSnapshot(collection(db, USERS_COLL), (snap) => {
-    const users = snap.docs.map(d => d.data() as AppUser);
+  return onSnapshotWithRetry(collection(db, USERS_COLL), USERS_COLL, (snap: any) => {
+    const users = snap.docs.map((d: any) => d.data() as AppUser);
     onUpdate(users);
   }, (err) => console.error('Error fetching users:', err));
 }

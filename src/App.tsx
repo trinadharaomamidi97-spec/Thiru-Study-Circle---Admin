@@ -26,7 +26,10 @@ import {
   db,
   saveUserToFirebase,
   deleteUserFromFirebase,
-  syncUsersFromFirebase
+  syncUsersFromFirebase,
+  logFirestoreRequest,
+  logFirestoreError,
+  testDirectFirestoreAccess
 } from './utils/firebase';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { doc, onSnapshot } from 'firebase/firestore';
@@ -77,86 +80,150 @@ export default function App() {
   const [users, setUsers] = useState<AppUser[]>([]);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
 
-  // Listen to Firebase auth state & user profiles
+  // Sequential Authentication & Real-Time Listeners Lifecycle (Steps 3, 4, 5)
   useEffect(() => {
     setAuthLoading(true);
-    let unsubProfile: (() => void) | undefined;
+    let cleanupActiveSession = () => {};
 
     const unsubAuth = onAuthStateChanged(auth, async (authUser) => {
-      setFirebaseUser(authUser);
-      if (authUser) {
-        const userDocRef = doc(db, 'app_users', authUser.uid);
-        unsubProfile = onSnapshot(userDocRef, (docSnap) => {
-          if (docSnap.exists()) {
-            const profile = docSnap.data() as AppUser;
-            setUserProfile(profile);
-            if (profile.role === 'student' && activeTab !== 'student-view') {
-              setActiveTab('student-view');
-            }
-          } else {
-            // Safe fallback if user record is missing in firestore
-            setUserProfile({
-              id: authUser.uid,
-              email: authUser.email || '',
-              name: authUser.email?.split('@')[0] || 'User',
-              role: 'admin',
-              status: 'Approved',
-              enrolledCourses: [],
-              createdAt: new Date().toISOString()
-            });
-          }
-          setAuthLoading(false);
-        }, (err) => {
-          console.error("Error reading profile snapshot:", err);
-          setAuthLoading(false);
-        });
-      } else {
+      // Step 4: Immediately tear down previous listeners on auth state change
+      cleanupActiveSession();
+
+      if (!authUser) {
+        setFirebaseUser(null);
         setUserProfile(null);
-        if (unsubProfile) unsubProfile();
+        setUsers([]);
+        setIsSyncing(false);
         setAuthLoading(false);
+        return;
+      }
+
+      setAuthLoading(true);
+      setIsSyncing(true);
+      setFirebaseUser(authUser);
+
+      try {
+        // Step 3: Wait for token readiness BEFORE initiating any Firestore listeners
+        console.log('[STEP 3 AUTH TIMING] User authenticated:', authUser.uid, authUser.email);
+        console.log('[STEP 3 AUTH TIMING] Awaiting authUser.getIdToken(true)...');
+        await authUser.getIdToken(true);
+        console.log('[STEP 3 AUTH TIMING] ID token resolved and ready.');
+
+        // Step 5: Test direct Firestore access
+        console.log('[STEP 5] Testing direct Firestore access...');
+        const directTest = await testDirectFirestoreAccess(authUser.uid);
+        console.log('[STEP 5] Direct access test completed:', directTest);
+
+        const sessionUnsubscribes: (() => void)[] = [];
+        cleanupActiveSession = () => {
+          sessionUnsubscribes.forEach(unsub => {
+            try { unsub(); } catch {}
+          });
+          sessionUnsubscribes.length = 0;
+        };
+
+        // Step 3 & 4: Start real-time profile listener
+        const userDocRef = doc(db, 'app_users', authUser.uid);
+        const profilePath = `app_users/${authUser.uid}`;
+        let profileRetries = 0;
+        let unsubProfile: (() => void) | undefined;
+
+        const startProfileListener = () => {
+          if (unsubProfile) {
+            try { unsubProfile(); } catch {}
+          }
+          logFirestoreRequest(profilePath, 'listen (profile snapshot)');
+          unsubProfile = onSnapshot(userDocRef, (docSnap) => {
+            profileRetries = 0;
+            if (docSnap.exists()) {
+              const profile = docSnap.data() as AppUser;
+              setUserProfile(profile);
+              if (profile.role === 'student' && activeTab !== 'student-view') {
+                setActiveTab('student-view');
+              }
+            } else {
+              // Default profile fallback for administrator
+              const isAdminEmail = authUser.email?.toLowerCase() === 'trinadharaomamidi97@gmail.com';
+              setUserProfile({
+                id: authUser.uid,
+                email: authUser.email || '',
+                name: authUser.email?.split('@')[0] || 'Admin',
+                role: isAdminEmail ? 'admin' : 'student',
+                status: 'Approved',
+                enrolledCourses: [],
+                createdAt: new Date().toISOString()
+              });
+            }
+            setAuthLoading(false);
+          }, (err) => {
+            if (err.code === 'permission-denied' && profileRetries < 4) {
+              profileRetries++;
+              console.warn(`[Profile Listener] Transient permission-denied for ${profilePath}. Retrying (${profileRetries}/4)...`);
+              setTimeout(startProfileListener, 800);
+            } else {
+              logFirestoreError(profilePath, err);
+              console.error("Error reading profile snapshot:", err);
+              // Ensure administrator is not locked out of UI on profile read failure
+              const isAdminEmail = authUser.email?.toLowerCase() === 'trinadharaomamidi97@gmail.com';
+              if (isAdminEmail) {
+                setUserProfile({
+                  id: authUser.uid,
+                  email: authUser.email || '',
+                  name: authUser.email?.split('@')[0] || 'Admin',
+                  role: 'admin',
+                  status: 'Approved',
+                  enrolledCourses: [],
+                  createdAt: new Date().toISOString()
+                });
+              }
+              setAuthLoading(false);
+            }
+          });
+        };
+        startProfileListener();
+        sessionUnsubscribes.push(() => {
+          if (unsubProfile) {
+            try { unsubProfile(); } catch {}
+          }
+        });
+
+        // Step 3: Start /courses, /videos, /materials, /exams, /announcements listeners AFTER token readiness
+        const unsubData = syncFirestoreData((firebaseData) => {
+          setData(firebaseData);
+          setIsSyncing(false);
+        });
+        sessionUnsubscribes.push(unsubData);
+
+        // Step 3: Start /app_users directory listener for admin
+        if (authUser.email?.toLowerCase() === 'trinadharaomamidi97@gmail.com') {
+          const unsubUsers = syncUsersFromFirebase((firebaseUsers) => {
+            setUsers(firebaseUsers);
+          });
+          sessionUnsubscribes.push(unsubUsers);
+        }
+
+      } catch (err: any) {
+        console.error('[AUTH LIFECYCLE] Initialization error:', err);
+        setAuthLoading(false);
+        setIsSyncing(false);
       }
     });
 
     return () => {
       unsubAuth();
-      if (unsubProfile) unsubProfile();
+      cleanupActiveSession();
     };
   }, []);
 
-  // Sync complete user directory only for Admin users
+  // Listen for role updates on userProfile to sync user directory if granted admin later
   useEffect(() => {
-    if (userProfile && userProfile.role === 'admin') {
-      const unsubUsers = syncUsersFromFirebase((firebaseUsers) => {
+    if (userProfile && userProfile.role === 'admin' && firebaseUser?.email?.toLowerCase() !== 'trinadharaomamidi97@gmail.com') {
+      const unsub = syncUsersFromFirebase((firebaseUsers) => {
         setUsers(firebaseUsers);
       });
-      return () => unsubUsers();
-    } else {
-      setUsers([]);
+      return () => unsub();
     }
-  }, [userProfile]);
-
-  // Initialize and subscribe to Firestore updates
-  useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
-    
-    async function initFirebaseSync() {
-      setIsSyncing(true);
-      // Seed if empty
-      await seedFirestoreIfEmpty();
-      
-      // Start listening to real-time changes
-      unsubscribe = syncFirestoreData((firebaseData) => {
-        setData(firebaseData);
-        setIsSyncing(false);
-      });
-    }
-
-    initFirebaseSync();
-
-    return () => {
-      if (unsubscribe) unsubscribe();
-    };
-  }, []);
+  }, [userProfile, firebaseUser]);
 
   const showToast = (message: string, type: 'success' | 'info' | 'error' = 'success') => {
     const id = Date.now();
