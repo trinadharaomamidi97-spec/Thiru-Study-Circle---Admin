@@ -18,4 +18,4 @@ jobs:
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_THIRU_STUDY_CIRCLE_ADMIN }}
-          projectId: thiru-study-cercle
+          projectId: thiru-study-circle-admin
